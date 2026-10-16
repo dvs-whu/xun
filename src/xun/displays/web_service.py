@@ -8,6 +8,7 @@ import re
 import secrets
 import socket
 import threading
+import time
 from contextlib import AbstractContextManager, ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ from urllib.parse import quote, urlencode, urlsplit
 import jinja2
 import uvicorn
 from fastapi import FastAPI, Form, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
@@ -26,7 +28,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount
 from starlette.types import Message
 
-from ..config import ASSET_DIR
+from ..config import ASSET_DIR, load_config, set_active_model
 from .web_display import WebDisplay
 
 
@@ -183,6 +185,30 @@ class SessionRename(BaseModel):
     name: str = Field(max_length=80)
 
 
+class ModelSelection(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+# Speech and retrieval models are listed by the same provider but cannot run a chat turn.
+_NON_CHAT_MODEL_MARKERS = ("asr", "tts", "voice", "embed", "whisper", "rerank")
+
+
+def _chat_model_ids(model_ids: list[str], current: str) -> list[str]:
+    def usable(model_id: str) -> bool:
+        if model_id == current:
+            return True
+        lowered = model_id.lower()
+        return not any(marker in lowered for marker in _NON_CHAT_MODEL_MARKERS)
+
+    ordered: list[str] = []
+    for model_id in model_ids:
+        if model_id and usable(model_id) and model_id not in ordered:
+            ordered.append(model_id)
+    if current and current not in ordered:
+        ordered.insert(0, current)
+    return ordered
+
+
 @dataclass
 class _DisplaySession:
     display: WebDisplay
@@ -246,8 +272,10 @@ class WebDisplayService:
                 "video/*",
             ),
         )
+        self._model_cache: tuple[float, list[str]] | None = None
         self._configure_login()
         self._configure_sessions()
+        self._configure_models()
         self._configure_chat(assets_dir)
         self._configure_docs(docs_dir)
         self.app.add_middleware(
@@ -315,6 +343,70 @@ class WebDisplayService:
             if self._session_manager is None:
                 raise HTTPException(405, "Session management is disabled")
             return self.rename(request.path, request.name)
+
+    def _configure_models(self) -> None:
+        models_path = f"{self.base_path}/api/models"
+
+        @self.app.get(models_path)
+        async def list_models() -> dict[str, Any]:
+            return await run_in_threadpool(self._model_catalog)
+
+        @self.app.post(models_path)
+        async def select_model(selection: ModelSelection) -> dict[str, Any]:
+            return await run_in_threadpool(lambda: self._select_model(selection.name))
+
+    def _model_catalog(self) -> dict[str, Any]:
+        current = self._current_model_name()
+        return {"model": current, "models": _chat_model_ids(self._provider_model_ids(), current)}
+
+    def _select_model(self, name: str) -> dict[str, Any]:
+        catalog = self._model_catalog()
+        cleaned = name.strip()
+        if cleaned not in catalog["models"]:
+            raise HTTPException(400, "Unknown model")
+        try:
+            selected = set_active_model(cleaned)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        with self._session_lock:
+            for session in self._sessions.values():
+                for agent in session.display.agents.values():
+                    model = getattr(getattr(agent, "config", None), "model", None)
+                    if model is not None:
+                        model.name = selected
+        catalog["model"] = selected
+        return catalog
+
+    def _current_model_name(self) -> str:
+        with self._session_lock:
+            for session in self._sessions.values():
+                for agent in session.display.agents.values():
+                    model = getattr(getattr(agent, "config", None), "model", None)
+                    if model is not None and getattr(model, "name", ""):
+                        return str(model.name)
+        return load_config().model.name
+
+    def _provider_model_ids(self) -> list[str]:
+        now = time.monotonic()
+        if self._model_cache is not None and now - self._model_cache[0] < 60:
+            return self._model_cache[1]
+        try:
+            listed = [model.id for model in self._model_client().models.list().data]
+        except Exception as exc:
+            raise HTTPException(502, "Could not list models") from exc
+        self._model_cache = (now, listed)
+        return listed
+
+    def _model_client(self) -> Any:
+        with self._session_lock:
+            for session in self._sessions.values():
+                for agent in session.display.agents.values():
+                    client = getattr(agent, "openai_client", None)
+                    if client is not None:
+                        return client
+        config = load_config()
+        from openai import OpenAI
+        return OpenAI(base_url=config.provider.openai_base_url, api_key=config.provider.openai_api_key)
 
     def _configure_login(self) -> None:
         @self.app.get(self.login_path, response_class=HTMLResponse)

@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Bot, BookOpen, Check, Github, Globe, Languages, LoaderCircle, Monitor, Moon, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Settings, Sun, Type } from 'lucide-vue-next'
-import { api, appUrl, chatUrl, configureSession, docsUrl, formatTokens } from './api'
+import { api, appUrl, chatUrl, configureSession, docsUrl, errorMessage, formatTokens } from './api'
 import i18n, { resolveLocale, type Language } from './i18n'
 import InputComposer from './components/InputComposer.vue'
 import EventStream from './components/EventStream.vue'
@@ -31,6 +31,10 @@ const commands = ref<CommandInfo[]>([])
 const connected = ref(false)
 const exposeFiles = ref<boolean | null>(null)
 const settingsOpen = ref(false)
+const models = ref<string[]>([])
+const activeModel = ref('')
+const modelBusy = ref(false)
+const modelError = ref('')
 const sessions = ref<SessionInfo[]>([])
 const canManageSessions = ref(false)
 const sessionBusy = ref(false)
@@ -118,6 +122,44 @@ watch(() => settings.theme, theme => {
 watch(() => settings.language, language => {
   i18n.global.locale.value = resolveLocale(language)
 }, { immediate: true })
+watch(settingsOpen, open => {
+  if (open) void loadModels()
+})
+
+async function loadModels() {
+  modelError.value = ''
+  try {
+    const catalog = await api.models()
+    models.value = catalog.models
+    activeModel.value = catalog.model
+  } catch (reason) {
+    modelError.value = t('app.modelFailed')
+    if ((reason as { status?: number }).status !== 502) modelError.value = errorMessage(reason, t('app.modelFailed'))
+  }
+}
+
+async function changeModel(name: string) {
+  if (!name || name === activeModel.value || modelBusy.value) return
+  const previous = activeModel.value
+  activeModel.value = name
+  modelBusy.value = true
+  modelError.value = ''
+  try {
+    const catalog = await api.selectModel(name)
+    models.value = catalog.models
+    activeModel.value = catalog.model
+    const agentId = selectedAgentId.value
+    if (agentId) {
+      const capabilityData = await api.capabilities(agentId)
+      supportsVision.value = capabilityData.capabilities.includes('vision')
+    }
+  } catch (reason) {
+    activeModel.value = previous
+    modelError.value = errorMessage(reason, t('app.modelFailed'))
+  } finally {
+    modelBusy.value = false
+  }
+}
 watch([selectedAgentId, selectedOnly], () => stream.value?.anchor())
 watch([anyRunning, anyWaiting], ([running, waiting]) => setTabActivity({ running, waiting }), { immediate: true })
 watch([selectedAgentId, currentSessionPath], async ([agentId, sessionPath], [previousAgentId, previousSessionPath]) => {
@@ -579,6 +621,13 @@ onBeforeUnmount(() => {
           <div class="settings-wrap">
             <button class="icon-button" :title="t('app.displaySettings')" :aria-label="t('app.displaySettings')" :aria-expanded="settingsOpen" @click="settingsOpen = !settingsOpen"><Settings :size="17" /></button>
             <div v-if="settingsOpen" class="settings-menu">
+              <span class="settings-label">{{ t('app.model') }}</span>
+              <select class="model-select" :value="activeModel" :disabled="modelBusy || !models.length" :aria-label="t('app.model')" :title="t('app.modelHint')" @change="changeModel(($event.target as HTMLSelectElement).value)">
+                <option v-if="!models.length" value="">{{ t('app.modelLoading') }}</option>
+                <option v-for="name in models" :key="name" :value="name">{{ name }}</option>
+              </select>
+              <small class="model-hint">{{ t('app.modelHint') }}</small>
+              <small v-if="modelError" class="settings-error">{{ modelError }}</small>
               <span class="settings-label">{{ t('app.theme') }}</span>
               <div class="theme-options">
                 <button v-for="option in themeOptions" :key="option.value" :class="{ selected: settings.theme === option.value }" @click="settings.theme = option.value">

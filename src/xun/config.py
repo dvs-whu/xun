@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import os
 import functools
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 import openai
@@ -205,6 +206,47 @@ def _load_config(_cache_id: str | None = None) -> AgentConfig:
         return _load_config_file(config_path)
     else:
         return AgentConfig.default()
+
+_model_lock = threading.Lock()
+
+def set_active_model(name: str) -> str:
+    """Switch the process-wide model and remember it in `$XUN_HOME/config.json`.
+
+    New agents clone this config. Callers still update agents that already
+    hold their own clone. Only the model name is written, so an existing
+    config file keeps its other fields.
+    """
+    cleaned = name.strip()
+    if not cleaned or any(character in cleaned for character in "\r\n\x00"):
+        raise ValueError("Invalid model name")
+    with _model_lock:
+        config = load_config()
+        previous = config.model.name
+        config.model.name = cleaned
+        try:
+            _write_model_override(cleaned)
+        except Exception:
+            config.model.name = previous
+            raise
+    return cleaned
+
+def _write_model_override(name: str) -> None:
+    home_dir = get_home_dir()
+    home_dir.mkdir(parents=True, exist_ok=True)
+    config_path = home_dir / "config.json"
+    data: dict = {}
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            raise RuntimeError(f"Config file {config_path} must contain a JSON object.")
+        data = loaded
+    model = data.get("model")
+    if not isinstance(model, dict):
+        model = {}
+    model["name"] = name
+    data["model"] = model
+    config_path.write_text(json.dumps(data, indent=4) + "\n", encoding="utf-8")
 
 def load_config(force_reload: bool = False) -> AgentConfig:
     """Load the global config (cached per-process).

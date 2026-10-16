@@ -9,21 +9,71 @@ so servers are opt-in and short-lived.
 from __future__ import annotations
 
 import asyncio
+import html
+import os
 import secrets
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
+import anyio
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.datastructures import URL
+from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Mount
+from starlette.types import Scope
 
 from .web_file import AgentGetter, resolve_path
 
 SERVE_TTL_SECONDS = 3600
 MAX_SERVE_SERVERS = 16
+
+
+class _ListingFiles(StaticFiles):
+    """Serve files, and list a directory when it has no index.html."""
+
+    async def get_response(self, path: str, scope: Scope):
+        full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, path)
+        if stat_result and stat.S_ISDIR(stat_result.st_mode):
+            index_path, index_stat = await anyio.to_thread.run_sync(self.lookup_path, os.path.join(path, "index.html"))
+            if index_stat is not None and stat.S_ISREG(index_stat.st_mode):
+                return await super().get_response(path, scope)
+            if not scope["path"].endswith("/"):
+                url = URL(scope=scope)
+                return RedirectResponse(url.replace(path=url.path + "/"))
+            page = await anyio.to_thread.run_sync(self._index_html, path, full_path)
+            return HTMLResponse(page)
+        return await super().get_response(path, scope)
+
+    @staticmethod
+    def _index_html(path: str, full_path: str) -> str:
+        entries = []
+        for name in os.listdir(full_path):
+            child = os.path.join(full_path, name)
+            try:
+                is_dir = os.path.isdir(child)
+            except OSError:
+                continue
+            entries.append((not is_dir, name.lower(), name, is_dir))
+        entries.sort()
+        items = []
+        if path not in ("", "."):
+            items.append('<li><a href="../">../</a></li>')
+        for _dir_last, _sort_name, name, is_dir in entries:
+            href = quote(name) + ("/" if is_dir else "")
+            label = html.escape(name + ("/" if is_dir else ""), quote=True)
+            items.append(f'<li><a href="{html.escape(href, quote=True)}">{label}</a></li>')
+        title = "/" if path in ("", ".") else "/" + html.escape(path, quote=True)
+        body = "\n".join(items) or "<li>空目录</li>"
+        return (
+            "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            f"<title>{title}</title></head><body><h1>{title}</h1><ul>{body}</ul></body></html>"
+        )
 
 
 class ServeRequest(BaseModel):
@@ -63,7 +113,7 @@ class ServeManager:
         if len(self._sessions) >= self._max_servers:
             raise HTTPException(429, "Too many active servers; stop one first")
         key = secrets.token_urlsafe(12)
-        mount = Mount(f"/srv/{key}", StaticFiles(directory=target, html=True, follow_symlink=False))
+        mount = Mount(f"/srv/{key}", _ListingFiles(directory=target, html=True, follow_symlink=False))
         self._app.routes.append(mount)
         session = _ServeSession(
             path=path,

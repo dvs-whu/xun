@@ -145,6 +145,11 @@ export interface ModelCapabilities {
   capabilities: Array<'vision'>
 }
 
+export interface ModelCatalog {
+  model: string
+  models: string[]
+}
+
 export type ServerMessage = DisplayEvent
   | { type: 'pending_prompt'; data: PendingPrompt }
   | { type: 'prompt_resolved'; prompt_id: string }

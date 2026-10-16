@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 import json
+import re
 from types import UnionType
 from typing import (
     Annotated, Callable, Any, Optional, Sequence, 
@@ -188,6 +189,39 @@ def _sequence_coercer(is_tuple: bool):
         return value
     return BeforeValidator(coerce)
 
+_INT_TEXT = re.compile(r"[+-]?\d+")
+
+def _number_coercer(kind: type):
+    """Accept digit strings for int/float tool args. Non-numeric text is left for validation to reject."""
+    def coerce(value: Any) -> Any:
+        if isinstance(value, str):
+            text = value.strip()
+            if kind is int and _INT_TEXT.fullmatch(text):
+                return int(text)
+            if kind is float:
+                try:
+                    return float(text)
+                except ValueError:
+                    return value
+        return value
+    return BeforeValidator(coerce)
+
+def _tolerant_number_type(param_type: Any) -> Any:
+    """Wrap int/float hints (incl. inside Optional) so whole-number strings are accepted.
+    Unions with a str or bool member are left alone."""
+    if param_type is int or param_type is float:
+        return Annotated[param_type, _number_coercer(param_type)]
+    origin = get_origin(param_type)
+    if origin is Union or origin is UnionType:
+        args = get_args(param_type)
+        if str in args or bool in args:
+            return param_type
+        wrapped = tuple(_tolerant_number_type(arg) for arg in args)
+        if wrapped == args:
+            return param_type
+        return Union[wrapped]
+    return param_type
+
 def _tolerant_sequence_type(param_type: Any) -> Any:
     """Wrap list/tuple hints (incl. inside Optional) so stringified arrays are accepted.
     Unions with a plain str member are left alone: the string there is intentional input."""
@@ -219,7 +253,7 @@ def _build_args_model_from_function(func: Callable, skip_keys: list[str] = []) -
             param_type = Any
 
         default = ... if param.default is inspect.Parameter.empty else param.default
-        fields[name] = (_tolerant_sequence_type(param_type), default)
+        fields[name] = (_tolerant_number_type(_tolerant_sequence_type(param_type)), default)
 
     create_fields = cast(dict[str, Any], fields)
     return create_model(  # type: ignore[call-overload]

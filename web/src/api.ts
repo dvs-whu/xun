@@ -1,4 +1,4 @@
-import type { AgentInfo, CommandInfo, DisplayEvent, FileListing, ModelCapabilities, PathInfo, PendingPrompt, SavedFile, ServeServer, SessionInfo, SessionList, WebConfig } from './types'
+import type { AgentInfo, CommandInfo, DisplayEvent, FileListing, ModelCapabilities, ModelCatalog, PathInfo, PendingPrompt, SavedFile, ServeServer, SessionInfo, SessionList, WebConfig } from './types'
 import i18n from './i18n'
 
 const configuredServiceRoot = import.meta.env.VITE_XUN_BASE_PATH as string | undefined
@@ -17,6 +17,10 @@ export function configureSession(path: string): void {
 
 function sessionUrl(): string {
   return `${serviceRoot}/api/sessions`
+}
+
+function modelsUrl(): string {
+  return `${serviceRoot}/api/models`
 }
 
 export function chatUrl(sessionPath: string): string {
@@ -96,6 +100,12 @@ export const api = {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
+  }),
+  models: () => request<ModelCatalog>(modelsUrl()),
+  selectModel: (name: string) => request<ModelCatalog>(modelsUrl(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
   }),
   config: () => request<WebConfig>(appUrl('/api/config')),
   events: () => request<DisplayEvent[]>(appUrl('/api/events')),

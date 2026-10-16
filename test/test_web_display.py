@@ -1,4 +1,6 @@
 import base64
+import json
+import os
 import shlex
 import shutil
 import threading
@@ -9,6 +11,8 @@ from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -551,6 +555,29 @@ class WebDisplayTest(unittest.TestCase):
         for key in keys:
             self.assertTrue(self.client.post(f"api/serve/agent-1/{key}/stop").json()["stopped"])
 
+    def test_serve_lists_directory_without_index(self) -> None:
+        notes = self.root / "notes"
+        notes.mkdir()
+        (notes / "prcv.txt").write_text("hello", encoding="utf-8")
+        (notes / "nested").mkdir()
+
+        server = self.client.post("api/serve/agent-1/start", json={"path": "notes"}).json()
+        home = self.client.get(server["url"].lstrip("/"))
+        self.assertEqual(home.status_code, 200)
+        self.assertIn("prcv.txt", home.text)
+        self.assertIn('href="nested/"', home.text)
+        body = self.client.get(server["url"].lstrip("/") + "prcv.txt")
+        self.assertEqual(body.status_code, 200)
+        self.assertEqual(body.text, "hello")
+        nested = self.client.get(server["url"].lstrip("/") + "nested/")
+        self.assertEqual(nested.status_code, 200)
+        self.assertIn('href="../"', nested.text)
+
+        bare = self.client.get(server["url"].lstrip("/").rstrip("/"), follow_redirects=False)
+        self.assertEqual(bare.status_code, 307)
+        self.assertTrue(bare.headers["location"].endswith("/"))
+        self.assertTrue(self.client.post(f"api/serve/agent-1/{server['key']}/stop").json()["stopped"])
+
     def test_serve_workspace_root(self) -> None:
         (self.root / "index.html").write_text("<main>root site</main>", encoding="utf-8")
         (self.root / "sub").mkdir()
@@ -700,6 +727,67 @@ class WebDisplayTest(unittest.TestCase):
             thread.join(1)
         self.assertEqual(results, {"agent-1": "agent-1", "agent-2": "agent-2"})
         self.assertEqual(self.client.get("api/prompts").json(), [])
+
+    def test_model_selection_updates_every_session(self) -> None:
+        class _Models:
+            def list(self) -> SimpleNamespace:
+                return SimpleNamespace(data=[
+                    SimpleNamespace(id="mimo-v2.6-pro"),
+                    SimpleNamespace(id="mimo-v2.5-tts"),
+                    SimpleNamespace(id="mimo-v2.6-flash"),
+                ])
+
+        class _Client:
+            models = _Models()
+
+        other = _Agent(self.root, identifier="agent-2", name="Other")
+        other_display = WebDisplay()
+        other.display = other_display
+        other_display.bind(other)  # type: ignore[arg-type]
+        self.service.mount("/other", other_display)
+        self.agent.openai_client = _Client()  # type: ignore[attr-defined]
+        other.openai_client = _Client()  # type: ignore[attr-defined]
+
+        from xun import config as config_module
+        keys = ("XUN_HOME", "XUN_OPENAI_BASE_URL", "XUN_OPENAI_API_KEY", "XUN_OPENAI_MODEL")
+        previous = {key: os.environ.get(key) for key in keys}
+        home = self.root / "xun-home"
+        home.mkdir()
+        (home / "config.json").write_text('{"auto_confirm": false}\n', encoding="utf-8")
+        os.environ["XUN_HOME"] = str(home)
+        os.environ["XUN_OPENAI_BASE_URL"] = "http://localhost"
+        os.environ["XUN_OPENAI_API_KEY"] = "test-key"
+        os.environ["XUN_OPENAI_MODEL"] = "mimo-v2.6-pro"
+        config_module._load_config.cache_clear()
+        try:
+            self.assertEqual(self.client.get("http://testserver/api/models", headers={"Authorization": ""}).status_code, 401)
+            listed = self.client.get("http://testserver/api/models")
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual(listed.json(), {
+                "model": "test-model",
+                "models": ["test-model", "mimo-v2.6-pro", "mimo-v2.6-flash"],
+            })
+            rejected = self.client.post("http://testserver/api/models", json={"name": "mimo-v2.5-tts"})
+            self.assertEqual(rejected.status_code, 400)
+            self.assertEqual(self.agent.config.model.name, "test-model")
+
+            selected = self.client.post("http://testserver/api/models", json={"name": "mimo-v2.6-flash"})
+            self.assertEqual(selected.status_code, 200)
+            self.assertEqual(selected.json()["model"], "mimo-v2.6-flash")
+            self.assertEqual(self.agent.config.model.name, "mimo-v2.6-flash")
+            self.assertEqual(other.config.model.name, "mimo-v2.6-flash")
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+            self.assertFalse(saved["auto_confirm"])
+            self.assertEqual(saved["model"]["name"], "mimo-v2.6-flash")
+            config_module._load_config.cache_clear()
+            self.assertEqual(config_module.load_config().model.name, "mimo-v2.6-flash")
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            config_module._load_config.cache_clear()
 
     def test_authentication_base_path_and_capabilities(self) -> None:
         display = WebDisplay()
